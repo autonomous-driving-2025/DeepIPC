@@ -14,7 +14,7 @@ from torchvision import datasets, transforms
 import utility
 
 class KARR_Dataset(Dataset):
-    def __init__(self, data_root, conditions, config):
+    def __init__(self, data_dir, conditions, config):
         self.config = config
         self.seq_len = config.seq_len
         self.pred_len = config.pred_len
@@ -40,8 +40,8 @@ class KARR_Dataset(Dataset):
         self.velocity = []
 
         for condition in conditions:
-            sub_root = os.path.join(data_root, condition)
-            preload_file = os.path.join(sub_root, 'xr14_seq'+str(self.seq_len)+'_pred'+str(self.pred_len)+'_rp1'+str(self.rp1_close)+'_maf'+str(self.config.n_buffer*self.data_rate)+'.npy')
+            sub_root = os.path.join(data_dir, condition)
+            preload_file = os.path.join(sub_root, 'ai23_seq'+str(self.seq_len)+'_pred'+str(self.pred_len)+'_rp1'+str(self.rp1_close)+'_maf'+str(self.config.n_buffer*self.data_rate)+'.npy')
 
             # dump to npy if no preload
             if not os.path.exists(preload_file):
@@ -61,10 +61,7 @@ class KARR_Dataset(Dataset):
                 preload_rp2_lat = []
                 preload_bearing = []
                 preload_loc_heading = []
-                preload_steering = []
-                preload_throttle = []
-                preload_velocity_l = []
-                preload_velocity_r = []
+                preload_velocity = []
 
                 # list sub-directories in root
                 root_files = os.listdir(sub_root)
@@ -151,20 +148,17 @@ class KARR_Dataset(Dataset):
                         elif -90 < bearing_deg <= 0: #Q4 270 - 360
                             bearing_deg_maf = np.degrees(np.arcsin(sin_angle_buff_mean))
                         sin_angle_buff.popleft() #hilangkan 1 untuk diisilagi dengan next data nantinya
-                        bearing_robot_deg = bearing_deg_maf+self.config.bearing_bias
+                        car_bearing_deg = bearing_deg_maf+self.config.bearing_bias
 
-                        if bearing_robot_deg > 180: #buat jadi -180 ke 0
-                            bearing_robot_deg = bearing_robot_deg - 360
-                        elif bearing_robot_deg < -180: #buat jadi 180 ke 0
-                            bearing_robot_deg = bearing_robot_deg + 360
-                        preload_bearing.append(np.radians(bearing_robot_deg))
+                        if car_bearing_deg > 180: #buat jadi -180 ke 0
+                            car_bearing_deg = car_bearing_deg - 360
+                        elif car_bearing_deg < -180: #buat jadi 180 ke 0
+                            car_bearing_deg = car_bearing_deg + 360
+                        preload_bearing.append(np.radians(car_bearing_deg))
 
                         #vehicular controls
-                        preload_steering.append(meta_current['steering'])
-                        preload_throttle.append(meta_current['throttle'])
-                        preload_velocity_l.append(meta_current['velocity'])
-                        preload_velocity_r.append(meta_current['velocity'])
-
+                        preload_velocity(meta_current['velocity'])
+                        
                         #assign next route lat lon
                         about_to_finish = False
                         for r in range(2): #ada 2 route point
@@ -230,10 +224,7 @@ class KARR_Dataset(Dataset):
                 preload_dict['rp2_lat'] = preload_rp2_lat
                 preload_dict['bearing'] = preload_bearing
                 preload_dict['loc_heading'] = preload_loc_heading
-                preload_dict['steering'] = preload_steering
-                preload_dict['throttle'] = preload_throttle
-                preload_dict['velocity_l'] = preload_velocity_l
-                preload_dict['velocity_r'] = preload_velocity_r
+                preload_dict['velocity'] = preload_velocity
                 np.save(preload_file, preload_dict)
 
 
@@ -256,16 +247,11 @@ class KARR_Dataset(Dataset):
             self.rp2_lat += preload_dict.item()['rp2_lat']
             self.bearing += preload_dict.item()['bearing']
             self.loc_heading += preload_dict.item()['loc_heading']
+            self.velocity += preload_dict.item()['velocity']
             print("TYPE:", type(preload_dict))
             print("ITEM TYPE:", type(preload_dict.item()))
             print("KEYS:", preload_dict.item().keys())
             print("Loading from:", preload_file)
-
-
-            self.steering += preload_dict.item()['steering']
-            self.throttle += preload_dict.item()['throttle']
-            self.velocity_l += preload_dict.item()['velocity_l']
-            self.velocity_r += preload_dict.item()['velocity_r']
             print("Preloading " + str(len(preload_dict.item()['rgb'])) + " sequences from " + preload_file)
 
 
@@ -304,7 +290,7 @@ class KARR_Dataset(Dataset):
             data['pt_cloud_zs'].append(torch.from_numpy(pt_cloud[2:3, :, :].astype(np.float32)))
 
 
-        #current ego robot position dan heading di index 0
+        #current ego car position dan heading di index 0
         ego_loc_x = seq_loc_xs[0]
         ego_loc_y = seq_loc_ys[0]
         ego_loc_heading = seq_loc_headings[0]
@@ -320,15 +306,15 @@ class KARR_Dataset(Dataset):
         # convert rp1_lon, rp1_lat rp2_lon, rp2_lat ke local coordinates
         #komputasi dari global ke local
         #https://gamedev.stackexchange.com/questions/79765/how-do-i-convert-from-the-global-coordinate-space-to-a-local-space
-        bearing_robot = self.bearing[index]
-        lat_robot = self.lat[index]
-        lon_robot = self.lon[index]
-        R_matrix = np.array([[np.cos(bearing_robot), -np.sin(bearing_robot)],
-                            [np.sin(bearing_robot),  np.cos(bearing_robot)]])
-        dLat1_m = (self.rp1_lat[index]-lat_robot) * 40008000 / 360 #111320 #Y
-        dLon1_m = (self.rp1_lon[index]-lon_robot) * 40075000 * np.cos(np.radians(lat_robot)) / 360 #X
-        dLat2_m = (self.rp2_lat[index]-lat_robot) * 40008000 / 360 #111320 #Y
-        dLon2_m = (self.rp2_lon[index]-lon_robot) * 40075000 * np.cos(np.radians(lat_robot)) / 360 #X
+        car_bearing = self.bearing[index]
+        lat_car = self.lat[index]
+        lon_car = self.lon[index]
+        R_matrix = np.array([[np.cos(car_bearing), -np.sin(car_bearing)],
+                            [np.sin(car_bearing),  np.cos(car_bearing)]])
+        dLat1_m = (self.rp1_lat[index]-lat_car) * 40008000 / 360 #111320 #Y
+        dLon1_m = (self.rp1_lon[index]-lon_car) * 40075000 * np.cos(np.radians(lat_car)) / 360 #X
+        dLat2_m = (self.rp2_lat[index]-lat_car) * 40008000 / 360 #111320 #Y
+        dLon2_m = (self.rp2_lon[index]-lon_car) * 40075000 * np.cos(np.radians(lat_car)) / 360 #X
         data['rp1'] = tuple(R_matrix.T.dot(np.array([dLon1_m, dLat1_m])))
         data['rp2'] = tuple(R_matrix.T.dot(np.array([dLon2_m, dLat2_m])))
 
@@ -338,14 +324,12 @@ class KARR_Dataset(Dataset):
         # print("rp2_lon "+str(self.rp2_lon[index]))
 
         #vehicular controls dan velocity jadikan satu LR
-        data['steering'] = self.steering[index]
-        data['throttle'] = self.throttle[index]
-        data['lr_velo'] = tuple(np.array([self.velocity_l[index], self.velocity_r[index]]))
+        data['velocity'] = self.velocity[index]
 
         #metadata buat testing nantinya
-        data['bearing_robot'] = np.degrees(bearing_robot)
-        data['lat_robot'] = lat_robot
-        data['lon_robot'] = lon_robot
+        data['car_bearing'] = np.degrees(car_bearing)
+        data['lat_car'] = lat_car
+        data['lon_car'] = lon_car
 
         return data
 
@@ -353,16 +337,29 @@ class KARR_Dataset(Dataset):
 class KARR_DataModule(pl.LightningDataModule):
     def __init__(self, data_dir, conditions, config):
         super().__init__()
+        self.data_dir = data_dir
+        self.conditions = conditions
+        self.config = config
+        self.train_dataset = None
+        self.test_dataset = None
+        self.val_dataset = None
+        
 
     def setup(self, stage=None):
-        pass
+        if stage == "fit" or stage is None:
+            self.train_dataset = KARR_Dataset(data_dir = self.data_dir,conditions= self.config.train_conditions,config = self.config)
+            self.val_dataset = KARR_Dataset(data_dir = self.data_dir, conditions = self.config.val_conditions, config=self.config)
+        
+        if stage == "test":
+            self.test = KARR_Dataset(self.data_dir, self.config.test_conditions, self.config)
+            
 
     def train_dataloader(self):
-        pass
+        return DataLoader(self.train_dataset, shuffle=False, pin_memory = True, self.config.batch_size, num_workers = self.config.num_workers, drop_last=True)
 
     def val_dataloader(self):
-        pass
+        return DataLoader(self.val_dataset, shuffle=False, pin_memory=True, self.config.batch_size, num_workers = self.config.num_workers, drop_last=False)
 
     def test_dataloader(self):
-        pass
+        return DataLoader(self.test_dataset, shuffle=False, pin_memory=True, self.config.batch_size, num_workers = self.config.num_workers, drop_last=False)
 

@@ -3,6 +3,7 @@ import os
 class GlobalConfig:
     ctrl_opt = 'one_of' #one_of both_must pid_only mlp_only
     gpu_id = '0'
+    num_workers = 14
     model = 'xr14'
     logdir = 'log/'+model+'_mix_mix'
     init_stop_counter = 30
@@ -11,8 +12,8 @@ class GlobalConfig:
     coverage_area = 24 #untuk top view SC, 24m kedepan, kiri, dan kanan
     rp1_close = 4 #ganti rp jika mendekati ...meter
     bearing_bias = 7.5 #dalam derajat, pastikan sama dengan yang ada di plot_wprp.py
-    n_buffer = 0 #buffer untuk MAF dalam second
-    data_rate = 4 # 1 detik ada berapa data?
+    n_buffer = 5 #buffer untuk MAF dalam second
+    data_rate = 5 # 1 detik ada berapa data?
 
     #parameter untuk MGN
     MGN = True
@@ -25,11 +26,11 @@ class GlobalConfig:
     pred_len = 3 # future waypoints predicted
     logdir = logdir+"_seq"+str(seq_len) #update direktori name
 
-    # root_dir = '/home/aisl/WHILL/ros-whill-robot/main/dataset' 
-    root_dir = '/media/mf/AUTODRIVING-4TB/UGM Baru/autoriving-oskarnatan/DeepIPC/xr14/dataset_ugm'
-    train_dir = root_dir+'/train'
-    val_dir = root_dir+'/val'
-    test_dir = root_dir+'/test'
+    # data_dir = '/home/aisl/WHILL/ros-whill-robot/main/dataset' 
+    data_dir = '/media/mf/AUTODRIVING-4TB/UGM Baru/autoriving-oskarnatan/DeepIPC/xr14/dataset_ugm'
+    train_dir = data_dir+'/train'
+    val_dir = data_dir+'/val'
+    test_dir = data_dir+'/test'
     #train: sunny0,2,4,6,8,11 sunset1,3,5,7,9,10
     # train_conditions = ['sunny', 'sunset'] #sunny route 2,4,6,11 ada sedikit adversarial
     train_conditions = ['sunny']
@@ -40,11 +41,11 @@ class GlobalConfig:
     # test_conditions = ['sunny3'] 
     # train_data, val_data, test_data = [], [], []
     # for weather in weathers:
-    #     train_data.append(os.path.join(root_dir+'/train_routes', weather))
-    #     val_data.append(os.path.join(root_dir+'/val_routes', weather))
+    #     train_data.append(os.path.join(data_dir+'/train_routes', weather))
+    #     val_data.append(os.path.join(data_dir+'/val_routes', weather))
     # test_weathers = ['cloudy']
     # for weather in test_weathers:
-    #     test_data.append(os.path.join(root_dir+'/test_routes', weather))
+    #     test_data.append(os.path.join(data_dir+'/test_routes', weather))
 
 
     crop_roi = [512, 1024] #HxW
