@@ -355,11 +355,11 @@ class KARR_DataModule(pl.LightningDataModule):
             
 
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, shuffle=False, pin_memory = True, self.config.batch_size, num_workers = self.config.num_workers, drop_last=True)
+        return DataLoader(self.train_dataset, shuffle=False, pin_memory = True, batch_size = self.config.batch_size, num_workers = self.config.num_workers, drop_last=True)
 
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, shuffle=False, pin_memory=True, self.config.batch_size, num_workers = self.config.num_workers, drop_last=False)
+        return DataLoader(self.val_dataset, shuffle=False, pin_memory=True, batch_size = self.config.batch_size, num_workers = self.config.num_workers, drop_last=False)
 
     def test_dataloader(self):
-        return DataLoader(self.test_dataset, shuffle=False, pin_memory=True, self.config.batch_size, num_workers = self.config.num_workers, drop_last=False)
+        return DataLoader(self.test_dataset, shuffle=False, pin_memory=True, batch_size = self.config.batch_size, num_workers = self.config.num_workers, drop_last=False)
 
