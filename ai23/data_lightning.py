@@ -1,6 +1,7 @@
 import os
 import yaml
 import cv2
+from pypcd import pypcd #https://github.com/dimatura/pypcd/issues/7 #pip3 install --upgrade git+https://github.com/klintan/pypcd.git
 from PIL import Image, ImageFile
 from collections import deque
 import numpy as np
@@ -104,7 +105,7 @@ class KARR_Dataset(Dataset):
                             rgbs.append(route_dir+"/camera/rgb/"+filename)
                             segs.append(route_dir+"/camera/seg/img/"+filename)
                             # pt_clouds.append(route_dir+"/point_cloud/"+filename[:-3]+"npy")
-                            pt_clouds.append(route_dir+"/camera/depth/cld2/"+filename[:-3]+"npy")
+                            pt_clouds.append(route_dir+"/camera/depth/cld/"+filename[:-3]+"pcd")
 
                         #appendkan
                         preload_rgb.append(rgbs)
@@ -283,7 +284,14 @@ class KARR_Dataset(Dataset):
         #SEG
             data['segs'].append(torch.from_numpy(np.array(cls2one_hot(crop_matrix(cv2.imread(seq_segs[i]), resize=self.config.scale, crop=self.config.crop_roi), n_class=self.config.n_class))))
 
-            pt_cloud = np.nan_to_num(crop_matrix(np.load(seq_pt_clouds[i])[:,:,0:3], resize=self.config.scale, crop=self.config.crop_roi).transpose(2,0,1), nan=0.0, posinf=39.99999, neginf=0.2) #min_d, max_d, -max_d, ambil xyz-nya saja 0:3, baca https://www.stereolabs.com/docs/depth-sensing/depth-settings/
+            pt_cloud = pypcd.PointCloud.from_path(seq_pt_clouds[i]).pc_data
+            pt_cloud = np.stack([pt_cloud['x'], pt_cloud['y'], pt_cloud['z']], axis=-1)
+            pt_cloud_temp = np.full((h * w, 3), np.nan, dtype=pt_cloud.dtype)
+            pt_cloud_temp[:pt_cloud.shape[0]] = pt_cloud
+            pt_cloud = pt_cloud_temp.reshape(h, w, 3)
+
+
+            pt_cloud = np.nan_to_num(crop_matrix(np.load(pt_cloud)[:,:,0:3], resize=self.config.scale, crop=self.config.crop_roi).transpose(2,0,1), nan=0.0, posinf=39.99999, neginf=0.2) #min_d, max_d, -max_d, ambil xyz-nya saja 0:3, baca https://www.stereolabs.com/docs/depth-sensing/depth-settings/
             # data['pt_cloud_xs'].append(torch.from_numpy(np.array(pt_cloud[0:1,:,:])))
             # data['pt_cloud_zs'].append(torch.from_numpy(np.array(pt_cloud[2:3,:,:])))
             data['pt_cloud_xs'].append(torch.from_numpy(pt_cloud[0:1, :, :].astype(np.float32)))
