@@ -199,20 +199,21 @@ class ai23(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         device = self.device
         config = self.config
+
+        # Get optimizers manually (since automatic optimization is disabled)
         opt, opt_lw = self.optimizers()
-        sch, _ = self.lr_schedulers()
-        score = {'total_loss': AverageMeter(),
-            'ss_loss': AverageMeter(),
-            'wp_loss': AverageMeter(),
-        }
 
-        prog_bar = tqdm(total=len(batch))
+        # Initialize loss trackers
+        total_loss_meter = AverageMeter()
+        seg_loss_meter = AverageMeter()
+        wp_loss_meter = AverageMeter()
 
-        total_batch = len(batch)
-
+        # --------------------------
+        # 1. Prepare input tensors
+        # --------------------------
         rgbs, segs, pt_cloud_xs, pt_cloud_zs = [], [], [], []
 
-        for i in range(self.config.seq_len):
+        for i in range(config.seq_len):
             rgbs.append(batch['rgbs'][i].to(device, dtype=torch.float))
             segs.append(batch['segs'][i].to(device, dtype=torch.float))
             pt_cloud_xs.append(batch['pt_cloud_xs'][i].to(device, dtype=torch.float))
@@ -228,107 +229,218 @@ class ai23(pl.LightningModule):
         ]
         gt_waypoints = torch.stack(gt_waypoints, dim=1).to(device, dtype=torch.float)
 
-        # forward + loss
+        # --------------------------
+        # 2. Forward pass
+        # --------------------------
         pred_segs, pred_wp, _ = self(rgbs, pt_cloud_xs, pt_cloud_zs, rp1, rp2, gt_velocity)
-        # compute loss
+
+        # --------------------------
+        # 3. Compute losses
+        # --------------------------
         loss_seg = 0
-        for i in range(0, self.config.seq_len):
-            loss_seg = loss_seg + utility.BCEDice(pred_segs[i], segs_gt[i])
-        loss_seg = loss_seg / self.config.seq_len
-        loss_wp = F.l1_loss(pred_wp, wp_gt)
-        total_loss = params_lw[0]*loss_seg + params_lw[1]*loss_wp
+        for i in range(config.seq_len):
+            loss_seg += utility.BCEDice(pred_segs[i], segs[i])
+        loss_seg /= config.seq_len
 
-        # backpro, kalkulasi gradient, dan optimasi
-        opt.zero_grad()
+        loss_wp = F.l1_loss(pred_wp, gt_waypoints)
 
-        if batch_idx == 0: # First batch, calculate first loss
-            self.manual_backward(total_loss) # Does not need to retain the graph
-            # Take the first loss
-            loss_seg_0 = torch.clone(loss_seg)
-            loss_wp_0 = torch.clone(loss_wp)
-        elif 0 < batch_idx < total_batch-1:
+        # Get current loss weights
+        params_lw = opt_lw.param_groups[0]['params']
+        total_loss = params_lw[0] * loss_seg + params_lw[1] * loss_wp
+
+        # --------------------------
+        # 4. Backpropagation
+        # --------------------------
+        opt.zero_grad(set_to_none=True)
+
+        if batch_idx == 0:
+            # Store initial losses for GradNorm
+            self.loss_seg_0 = loss_seg.detach()
+            self.loss_wp_0 = loss_wp.detach()
             self.manual_backward(total_loss)
 
-        elif batch_idx == total_batch-1: # A last batch, compute the loss weight update
-            if self.config.MGN:
-                opt.zero_grad()
+        elif batch_idx < len(self.trainer.train_dataloader) - 1:
+            self.manual_backward(total_loss)
+
+        else:
+            # Last batch of the epoch → GradNorm update
+            if config.MGN:
+                opt_lw.zero_grad(set_to_none=True)
                 self.manual_backward(total_loss, retain_graph=True)
-                # ambil nilai gradient dari layer pertama pada masing2 task-specified decoder dan komputasi gradient dari output layer sampai ke bottle neck saja
-                params = list(filter(lambda p: p.requires_grad, model.parameters()))
+
+                params = list(filter(lambda p: p.requires_grad, self.parameters()))
+
+                # Gradient norms for each task
                 G0R = torch.autograd.grad(loss_seg, params[config.bottleneck[0]], retain_graph=True, create_graph=True)
                 G0 = torch.norm(G0R[0], keepdim=True)
                 G1R = torch.autograd.grad(loss_wp, params[config.bottleneck[1]], retain_graph=True, create_graph=True)
                 G1 = torch.norm(G1R[0], keepdim=True)
-                #dan rata2
-                G_avg = (G0+G1) / len(config.loss_weights)
 
-                #hitung relative lossnya
-                loss_seg_hat = loss_seg / loss_seg_0
-                loss_wp_hat = loss_wp / loss_wp_0
-                #dan rata2
-                loss_hat_avg = (loss_seg_hat + loss_wp_hat) / len(self.config.loss_weights)
+                G_avg = (G0 + G1) / len(config.loss_weights)
 
-                #hitung r_i_(t) relative inverse training rate untuk setiap task
+                # Relative losses
+                loss_seg_hat = loss_seg / (self.loss_seg_0 + 1e-8)
+                loss_wp_hat = loss_wp / (self.loss_wp_0 + 1e-8)
+                loss_hat_avg = (loss_seg_hat + loss_wp_hat) / len(config.loss_weights)
+
                 inv_rate_ss = loss_seg_hat / loss_hat_avg
                 inv_rate_wp = loss_wp_hat / loss_hat_avg
 
-                #hitung constant target grad
-                C0 = (G_avg*inv_rate_ss).detach()**config.lw_alpha
-                C1 = (G_avg*inv_rate_wp).detach()**config.lw_alpha
+                C0 = (G_avg * inv_rate_ss).detach() ** config.lw_alpha
+                C1 = (G_avg * inv_rate_wp).detach() ** config.lw_alpha
 
-                #HITUNG TOTAL LGRAD
                 Lgrad = F.l1_loss(G0, C0) + F.l1_loss(G1, C1)
-
-                #hitung gradient loss sesuai Eq. 2 di GradNorm paper
                 self.manual_backward(Lgrad)
-                #update loss weights
                 opt_lw.step()
-
-                #ambil lgrad untuk disimpan nantinya
-                lgrad = Lgrad.item()
-                new_param_lw = opt_lw.param_groups[0]['params']
+                self.lgrad = Lgrad.item()
             else:
                 self.manual_backward(total_loss)
-                lgrad = 0
-                new_param_lw = 1
+                self.lgrad = 0.0
 
-        opt.step() #dan update bobot2 pada network model
+        opt.step()
 
-        #hitung rata-rata (avg) loss, dan metric untuk batch-batch yang telah diproses
-        score['total_loss'].update(total_loss.item())
-        score['ss_loss'].update(loss_seg.item())
-        score['wp_loss'].update(loss_wp.item())
+        # --------------------------
+        # 5. Log losses
+        # --------------------------
+        total_loss_meter.update(total_loss.item())
+        seg_loss_meter.update(loss_seg.item())
+        wp_loss_meter.update(loss_wp.item())
 
-        #update visualisasi progress bar
-        postfix = OrderedDict([('t_total_l', score['total_loss'].avg),
-                            ('t_ss_l', score['ss_loss'].avg),
-                            ('t_wp_l', score['wp_loss'].avg),
-                            ('t_str_l', score['str_loss'].avg),
-                            ('t_thr_l', score['thr_loss'].avg)])
+        self.log("train_total_loss", total_loss_meter.avg, prog_bar=True, on_step=True, on_epoch=True)
+        self.log("train_seg_loss", seg_loss_meter.avg, prog_bar=False, on_step=True, on_epoch=True)
+        self.log("train_wp_loss", wp_loss_meter.avg, prog_bar=False, on_step=True, on_epoch=True)
 
-        #tambahkan ke summary writer
-        writer.add_scalar('t_total_l', total_loss.item(), cur_step)
-        writer.add_scalar('t_ss_l', loss_seg.item(), cur_step)
-        writer.add_scalar('t_wp_l', loss_wp.item(), cur_step)
+        return total_loss
 
-        prog_bar.set_postfix(postfix)
-        prog_bar.update(1)
-        batch_ke += 1
-        prog_bar.close()
+    def validation_step(self, batch, batch_idx):
+        device = self.device
+        config = self.config
 
-        return loss
+        # --------------------------
+        # 1. Prepare input tensors
+        # --------------------------
+        rgbs, segs, pt_cloud_xs, pt_cloud_zs = [], [], [], []
 
-    def validation_step(self, batch, batc_idx):
-        #buat variabel untuk menyimpan kalkulasi loss, dan iou
-        score = {'total_loss': AverageMeter(),
-            'ss_loss': AverageMeter(),
-            'wp_loss': AverageMeter(),
+        for i in range(config.seq_len):
+            rgbs.append(batch['rgbs'][i].to(device, dtype=torch.float))
+            segs.append(batch['segs'][i].to(device, dtype=torch.float))
+            pt_cloud_xs.append(batch['pt_cloud_xs'][i].to(device, dtype=torch.float))
+            pt_cloud_zs.append(batch['pt_cloud_zs'][i].to(device, dtype=torch.float))
+
+        rp1 = torch.stack(batch['rp1'], dim=1).to(device, dtype=torch.float)
+        rp2 = torch.stack(batch['rp2'], dim=1).to(device, dtype=torch.float)
+        gt_velocity = torch.stack(batch['lr_velo'], dim=1).to(device, dtype=torch.float)
+
+        gt_waypoints = [
+            torch.stack(batch['waypoints'][j], dim=1).to(device, dtype=torch.float)
+            for j in range(config.pred_len)
+        ]
+        gt_waypoints = torch.stack(gt_waypoints, dim=1).to(device, dtype=torch.float)
+
+        # --------------------------
+        # 2. Forward pass (no_grad)
+        # --------------------------
+        with torch.no_grad():
+            pred_segs, pred_wp, _ = self(rgbs, pt_cloud_xs, pt_cloud_zs, rp1, rp2, gt_velocity)
+
+            # --------------------------
+            # 3. Compute losses
+            # --------------------------
+            loss_seg = 0
+            for i in range(config.seq_len):
+                loss_seg += utility.BCEDice(pred_segs[i], segs[i])
+            loss_seg /= config.seq_len
+
+            loss_wp = F.l1_loss(pred_wp, gt_waypoints)
+
+            total_loss = loss_seg + loss_wp
+
+        # --------------------------
+        # 4. Log metrics
+        # --------------------------
+        self.log("val_total_loss", total_loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val_seg_loss", loss_seg, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val_wp_loss", loss_wp, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+
+        return {
+            "val_total_loss": total_loss.detach(),
+            "val_seg_loss": loss_seg.detach(),
+            "val_wp_loss": loss_wp.detach(),
         }
 
+    def validation_epoch_end(self, outputs):
+        avg_total = torch.stack([x["val_total_loss"] for x in outputs]).mean()
+        avg_seg = torch.stack([x["val_seg_loss"] for x in outputs]).mean()
+        avg_wp = torch.stack([x["val_wp_loss"] for x in outputs]).mean()
 
+        self.log("val_total_loss_epoch", avg_total, prog_bar=True)
+        self.log("val_seg_loss_epoch", avg_seg)
+        self.log("val_wp_loss_epoch", avg_wp)
 
     def test_step(self, batch, batch_idx):
-        pass
+        device = self.device
+        config = self.config
+
+        # --------------------------
+        # 1. Prepare input tensors
+        # --------------------------
+        rgbs, segs, pt_cloud_xs, pt_cloud_zs = [], [], [], []
+
+        for i in range(config.seq_len):
+            rgbs.append(batch['rgbs'][i].to(device, dtype=torch.float))
+            segs.append(batch['segs'][i].to(device, dtype=torch.float))
+            pt_cloud_xs.append(batch['pt_cloud_xs'][i].to(device, dtype=torch.float))
+            pt_cloud_zs.append(batch['pt_cloud_zs'][i].to(device, dtype=torch.float))
+
+        rp1 = torch.stack(batch['rp1'], dim=1).to(device, dtype=torch.float)
+        rp2 = torch.stack(batch['rp2'], dim=1).to(device, dtype=torch.float)
+        gt_velocity = torch.stack(batch['lr_velo'], dim=1).to(device, dtype=torch.float)
+
+        gt_waypoints = [
+            torch.stack(batch['waypoints'][j], dim=1).to(device, dtype=torch.float)
+            for j in range(config.pred_len)
+        ]
+        gt_waypoints = torch.stack(gt_waypoints, dim=1).to(device, dtype=torch.float)
+
+        # --------------------------
+        # 2. Forward pass (no_grad)
+        # --------------------------
+        with torch.no_grad():
+            pred_segs, pred_wp, _ = self(rgbs, pt_cloud_xs, pt_cloud_zs, rp1, rp2, gt_velocity)
+
+            # --------------------------
+            # 3. Compute losses
+            # --------------------------
+            loss_seg = 0
+            for i in range(config.seq_len):
+                loss_seg += utility.BCEDice(pred_segs[i], segs[i])
+            loss_seg /= config.seq_len
+
+            loss_wp = F.l1_loss(pred_wp, gt_waypoints)
+            total_loss = loss_seg + loss_wp
+
+        # --------------------------
+        # 4. Log metrics (for test set)
+        # --------------------------
+        self.log("test_total_loss", total_loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("test_seg_loss", loss_seg, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("test_wp_loss", loss_wp, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+
+        return {
+            "test_total_loss": total_loss.detach(),
+            "test_seg_loss": loss_seg.detach(),
+            "test_wp_loss": loss_wp.detach(),
+        }
+
+    def test_epoch_end(self, outputs):
+        avg_total = torch.stack([x["test_total_loss"] for x in outputs]).mean()
+        avg_seg = torch.stack([x["test_seg_loss"] for x in outputs]).mean()
+        avg_wp = torch.stack([x["test_wp_loss"] for x in outputs]).mean()
+
+        self.log("test_total_loss_epoch", avg_total, prog_bar=True)
+        self.log("test_seg_loss_epoch", avg_seg)
+        self.log("test_wp_loss_epoch", avg_wp)
+
 
     def configure_optimizers(self):
         optima = optim.AdamW(self.parameters(), weight_decay=self.config.weight_decay)
