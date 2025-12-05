@@ -197,6 +197,8 @@ class ai23(pl.LightningModule):
         return segs_f, pred_wp, sdcs
 
     def training_step(self, batch, batch_idx):
+        device = self.device
+        config = self.config
         opt, opt_lw = self.optimizers()
         sch, _ = self.lr_schedulers()
         score = {'total_loss': AverageMeter(),
@@ -208,9 +210,26 @@ class ai23(pl.LightningModule):
 
         total_batch = len(batch)
 
-        rgbs, pt_cloud_xs, pt_cloud_zs, rp1, rp2, velo_in, segs_gt, wp_gt, sdcs_gt = batch
-        pred_segs, pred_wp, _ = self(rgbs, pt_cloud_xs, pt_cloud_zs, rp1, rp2, velo_in)
+        rgbs, segs, pt_cloud_xs, pt_cloud_zs = [], [], [], []
 
+        for i in range(self.config.seq_len):
+            rgbs.append(batch['rgbs'][i].to(device, dtype=torch.float))
+            segs.append(batch['segs'][i].to(device, dtype=torch.float))
+            pt_cloud_xs.append(batch['pt_cloud_xs'][i].to(device, dtype=torch.float))
+            pt_cloud_zs.append(batch['pt_cloud_zs'][i].to(device, dtype=torch.float))
+
+        rp1 = torch.stack(batch['rp1'], dim=1).to(device, dtype=torch.float)
+        rp2 = torch.stack(batch['rp2'], dim=1).to(device, dtype=torch.float)
+        gt_velocity = torch.stack(batch['lr_velo'], dim=1).to(device, dtype=torch.float)
+
+        gt_waypoints = [
+            torch.stack(batch['waypoints'][j], dim=1).to(device, dtype=torch.float)
+            for j in range(config.pred_len)
+        ]
+        gt_waypoints = torch.stack(gt_waypoints, dim=1).to(device, dtype=torch.float)
+
+        # forward + loss
+        pred_segs, pred_wp, _ = self(rgbs, pt_cloud_xs, pt_cloud_zs, rp1, rp2, gt_velocity)
         # compute loss
         loss_seg = 0
         for i in range(0, self.config.seq_len):
@@ -300,7 +319,13 @@ class ai23(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batc_idx):
-        pass
+        #buat variabel untuk menyimpan kalkulasi loss, dan iou
+        score = {'total_loss': AverageMeter(),
+            'ss_loss': AverageMeter(),
+            'wp_loss': AverageMeter(),
+        }
+
+
 
     def test_step(self, batch, batch_idx):
         pass

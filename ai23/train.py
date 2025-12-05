@@ -12,7 +12,7 @@ import torch.nn.functional as F
 torch.backends.cudnn.benchmark = True
 
 import shutil
-from model import xr14
+from model_lightning import ai23
 from data import WHILL_Data, swap_RGB2BGR
 from config import GlobalConfig
 from torch.utils.tensorboard import SummaryWriter
@@ -342,7 +342,7 @@ def main():
 
     #IMPORT MODEL UNTUK DITRAIN
     print("IMPORT ARSITEKTUR DL DAN COMPILE")
-    model = xr14(config, device).to(device, dtype=torch.float)
+    model = ai23(config, device).to(device, dtype=torch.float)
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
     params = sum([np.prod(p.size()) for p in model_parameters])
     print('Total trainable parameters: ', params)
