@@ -60,3 +60,62 @@ def transform_2d_points(xyz, r1, t1_x, t1_y, r2, t2_x, t2_y):
     out[:,2] = xyz[:,2]
 
     return out
+
+#buat ngecek GT SEG aja
+def check_gt_seg(config, gt_seg):
+    gt_seg = gt_seg.cpu().detach().numpy()
+
+    #buat array untuk nyimpan out gambar
+    imgx = np.zeros((gt_seg.shape[2], gt_seg.shape[3], 3))
+    #ambil tensor segmentationnya
+    inx = np.argmax(gt_seg[0], axis=0)
+    for cmap in config.SEG_CLASSES['colors']:
+        cmap_id = config.SEG_CLASSES['colors'].index(cmap)
+        imgx[np.where(inx == cmap_id)] = cmap
+
+    #GANTI ORDER BGR KE RGB, SWAP!
+    imgx = swap_RGB2BGR(imgx)
+    cv2.imwrite(config.logdir+"/check_gt_seg.png", imgx) #cetak gt segmentation
+
+
+#Class untuk penyimpanan dan perhitungan update loss
+class AverageMeter(object):
+    def __init__(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+    #update kalkulasi
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+#Class NN Module untuk Perhitungan BCE Dice Loss
+def BCEDice(Yp, Yt, smooth=1e-7):
+    #.view(-1) artinya matrix tensornya di flatten kan dulu
+    Yp = Yp.view(-1)
+    Yt = Yt.view(-1)
+    #hitung BCE
+    bce = F.binary_cross_entropy(Yp, Yt, reduction='mean')
+    #hitung dice loss
+    intersection = (Yp * Yt).sum() #irisan
+    #rumus DICE
+    dice_loss = 1 - ((2. * intersection + smooth) / (Yp.sum() + Yt.sum() + smooth))
+    #kalkulasi lossnya
+    bce_dice_loss = bce + dice_loss
+    return bce_dice_loss
+
+
+#fungsi renormalize loss weights seperti di paper gradnorm
+def renormalize_params_lw(current_lw, config):
+    #detach dulu paramsnya dari torch, pindah ke CPU
+    lw = np.array([tens.cpu().detach().numpy() for tens in current_lw])
+    lws = np.array([lw[i][0] for i in range(len(lw))])
+    #fungsi renormalize untuk algoritma 1 di papaer gradnorm
+    coef = np.array(config.loss_weights).sum()/lws.sum()
+    new_lws = [coef*lwx for lwx in lws]
+    #buat torch float tensor lagi dan masukkan ke cuda memory
+    normalized_lws = [torch.cuda.FloatTensor([lw]).clone().detach().requires_grad_(True) for lw in new_lws]
+    return normalized_lws
