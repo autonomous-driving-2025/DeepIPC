@@ -158,7 +158,7 @@ class KARR_Dataset(Dataset):
                         preload_bearing.append(np.radians(car_bearing_deg))
 
                         #vehicular controls
-                        preload_velocity(meta_current['velocity'])
+                        preload_velocity.append(meta_current['velocity'])
                         
                         #assign next route lat lon
                         about_to_finish = False
@@ -286,12 +286,12 @@ class KARR_Dataset(Dataset):
 
             pt_cloud = pypcd.PointCloud.from_path(seq_pt_clouds[i]).pc_data
             pt_cloud = np.stack([pt_cloud['x'], pt_cloud['y'], pt_cloud['z']], axis=-1)
-            pt_cloud_temp = np.full((h * w, 3), np.nan, dtype=pt_cloud.dtype)
+            pt_cloud_temp = np.full((1280 * 720, 3), np.nan, dtype=pt_cloud.dtype)
             pt_cloud_temp[:pt_cloud.shape[0]] = pt_cloud
-            pt_cloud = pt_cloud_temp.reshape(h, w, 3)
+            pt_cloud = pt_cloud_temp.reshape(1280, 720, 3)
 
 
-            pt_cloud = np.nan_to_num(crop_matrix(np.load(pt_cloud)[:,:,0:3], resize=self.config.scale, crop=self.config.crop_roi).transpose(2,0,1), nan=0.0, posinf=39.99999, neginf=0.2) #min_d, max_d, -max_d, ambil xyz-nya saja 0:3, baca https://www.stereolabs.com/docs/depth-sensing/depth-settings/
+            pt_cloud = np.nan_to_num(crop_matrix(pt_cloud[ : , : , 0:3], resize=self.config.scale, crop=self.config.crop_roi).transpose(2,0,1), nan=0.0, posinf=39.99999, neginf=0.2) #min_d, max_d, -max_d, ambil xyz-nya saja 0:3, baca https://www.stereolabs.com/docs/depth-sensing/depth-settings/
             # data['pt_cloud_xs'].append(torch.from_numpy(np.array(pt_cloud[0:1,:,:])))
             # data['pt_cloud_zs'].append(torch.from_numpy(np.array(pt_cloud[2:3,:,:])))
             data['pt_cloud_xs'].append(torch.from_numpy(pt_cloud[0:1, :, :].astype(np.float32)))
@@ -358,8 +358,9 @@ class KARR_DataModule(pl.LightningDataModule):
             self.train_dataset = KARR_Dataset(data_dir = self.data_dir,conditions= self.config.train_conditions,config = self.config)
             self.val_dataset = KARR_Dataset(data_dir = self.data_dir, conditions = self.config.val_conditions, config=self.config)
         
-        if stage == "test":
-            self.test = KARR_Dataset(self.data_dir, self.config.test_conditions, self.config)
+        if stage == "test" or stage is None:
+            self.test_dataset = KARR_Dataset(self.data_dir, self.config.test_conditions, self.config)
+
             
 
     def train_dataloader(self):
