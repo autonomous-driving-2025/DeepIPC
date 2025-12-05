@@ -2,12 +2,19 @@ import os
 from collections import deque
 import sys
 import numpy as np
-from torch import torch, cat, nn
+import tqdm
+import torch
+from torch import nn, cat
+import torch.nn.functional as F
 import torchvision.models as models
-import torchvision.transforms as models
+import torch.optim as optim
+import torchvision.models as models
+import torchvision.transforms as transforms
 from torchvision.datasets import MNIST
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
+
+import utility
 
 def gen_top_view_sc_ptcloud(self, pt_cloud_x, pt_cloud_z, semseg):
         #proses awal
@@ -87,15 +94,16 @@ class ConvBlock(nn.Module):
 
 class ai23(pl.LightningModule):
     def __init__(self, config, device):#n_fmap, n_class=[23,10], n_wp=5, in_channel_dim=[3,2], spatial_dim=[240, 320], gpu_device=None):
-        super(xr14, self).__init__()
+        super(ai23, self).__init__()
         self.config = config
         self.gpu_device = device
+        self.automatic_optimization = False
         #------------------------------------------------------------------------------------------------
         #RGB, jika inputnya sequence, maka jumlah input channel juga harus menyesuaikan
         self.rgb_normalizer = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        self.RGB_encoder = models.efficientnet_b3(pretrained=True) #efficientnet_b4
+        self.RGB_encoder = models.efficientnet_b3(pretrained=True) #efficientnet_b4 bisa diganti
         self.RGB_encoder.classifier = nn.Sequential() #cara paling gampang untuk menghilangkan fc layer yang tidak diperlukan
-        self.RGB_encoder.avgpool = nn.Sequential() #cara paling gampang untuk menghilangkan fc layer yang tidak diperlukan
+        self.RGB_encoder.avgpool = nn.Sequential() # type: ignore # cara paling gampang untuk menghilangkan fc layer yang tidak diperlukan
         #SS
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         self.conv3_ss_f = ConvBlock(channel=[config.n_fmap_b3[4][-1]+config.n_fmap_b3[3][-1], config.n_fmap_b3[3][-1]])#, up=True)
@@ -187,3 +195,132 @@ class ai23(pl.LightningModule):
         pred_wp = torch.stack(out_wp, dim=1)
 
         return segs_f, pred_wp, sdcs
+
+    def training_step(self, batch, batch_idx):
+        opt, opt_lw = self.optimizers()
+        sch, _ = self.lr_schedulers()
+        score = {'total_loss': AverageMeter(),
+            'ss_loss': AverageMeter(),
+            'wp_loss': AverageMeter(),
+        }
+
+        prog_bar = tqdm(total=len(batch))
+
+        total_batch = len(batch)
+
+        rgbs, pt_cloud_xs, pt_cloud_zs, rp1, rp2, velo_in, segs_gt, wp_gt, sdcs_gt = batch
+        pred_segs, pred_wp, _ = self(rgbs, pt_cloud_xs, pt_cloud_zs, rp1, rp2, velo_in)
+
+        # compute loss
+        loss_seg = 0
+        for i in range(0, self.config.seq_len):
+            loss_seg = loss_seg + utility.BCEDice(pred_segs[i], segs_gt[i])
+        loss_seg = loss_seg / self.config.seq_len
+        loss_wp = F.l1_loss(pred_wp, wp_gt)
+        total_loss = params_lw[0]*loss_seg + params_lw[1]*loss_wp
+
+        # backpro, kalkulasi gradient, dan optimasi
+        opt.zero_grad()
+
+        if batch_idx == 0: # First batch, calculate first loss
+            self.manual_backward(total_loss) # Does not need to retain the graph
+            # Take the first loss
+            loss_seg_0 = torch.clone(loss_seg)
+            loss_wp_0 = torch.clone(loss_wp)
+        elif 0 < batch_idx < total_batch-1:
+            self.manual_backward(total_loss)
+
+        elif batch_idx == total_batch-1: # A last batch, compute the loss weight update
+            if self.config.MGN:
+                opt.zero_grad()
+                self.manual_backward(total_loss, retain_graph=True)
+                # ambil nilai gradient dari layer pertama pada masing2 task-specified decoder dan komputasi gradient dari output layer sampai ke bottle neck saja
+                params = list(filter(lambda p: p.requires_grad, model.parameters()))
+                G0R = torch.autograd.grad(loss_seg, params[config.bottleneck[0]], retain_graph=True, create_graph=True)
+                G0 = torch.norm(G0R[0], keepdim=True)
+                G1R = torch.autograd.grad(loss_wp, params[config.bottleneck[1]], retain_graph=True, create_graph=True)
+                G1 = torch.norm(G1R[0], keepdim=True)
+                #dan rata2
+                G_avg = (G0+G1) / len(config.loss_weights)
+
+                #hitung relative lossnya
+                loss_seg_hat = loss_seg / loss_seg_0
+                loss_wp_hat = loss_wp / loss_wp_0
+                #dan rata2
+                loss_hat_avg = (loss_seg_hat + loss_wp_hat) / len(self.config.loss_weights)
+
+                #hitung r_i_(t) relative inverse training rate untuk setiap task
+                inv_rate_ss = loss_seg_hat / loss_hat_avg
+                inv_rate_wp = loss_wp_hat / loss_hat_avg
+
+                #hitung constant target grad
+                C0 = (G_avg*inv_rate_ss).detach()**config.lw_alpha
+                C1 = (G_avg*inv_rate_wp).detach()**config.lw_alpha
+
+                #HITUNG TOTAL LGRAD
+                Lgrad = F.l1_loss(G0, C0) + F.l1_loss(G1, C1)
+
+                #hitung gradient loss sesuai Eq. 2 di GradNorm paper
+                self.manual_backward(Lgrad)
+                #update loss weights
+                opt_lw.step()
+
+                #ambil lgrad untuk disimpan nantinya
+                lgrad = Lgrad.item()
+                new_param_lw = opt_lw.param_groups[0]['params']
+            else:
+                self.manual_backward(total_loss)
+                lgrad = 0
+                new_param_lw = 1
+
+        opt.step() #dan update bobot2 pada network model
+
+        #hitung rata-rata (avg) loss, dan metric untuk batch-batch yang telah diproses
+        score['total_loss'].update(total_loss.item())
+        score['ss_loss'].update(loss_seg.item())
+        score['wp_loss'].update(loss_wp.item())
+
+        #update visualisasi progress bar
+        postfix = OrderedDict([('t_total_l', score['total_loss'].avg),
+                            ('t_ss_l', score['ss_loss'].avg),
+                            ('t_wp_l', score['wp_loss'].avg),
+                            ('t_str_l', score['str_loss'].avg),
+                            ('t_thr_l', score['thr_loss'].avg)])
+
+        #tambahkan ke summary writer
+        writer.add_scalar('t_total_l', total_loss.item(), cur_step)
+        writer.add_scalar('t_ss_l', loss_seg.item(), cur_step)
+        writer.add_scalar('t_wp_l', loss_wp.item(), cur_step)
+
+        prog_bar.set_postfix(postfix)
+        prog_bar.update(1)
+        batch_ke += 1
+        prog_bar.close()
+
+        return loss
+
+    def validation_step(self, batch, batc_idx):
+        pass
+
+    def test_step(self, batch, batch_idx):
+        pass
+
+    def configure_optimizers(self):
+        optima = optim.AdamW(self.parameters(), weight_decay=self.config.weight_decay)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optima, mode='min', factor=0.5, patience=4, min_lr=1e-6)
+
+        #optimizer lw
+        params_lw = [torch.cuda.FloatTensor([self.config.loss_weights[i]]).clone().detach().requires_grad_(True) for i in range(len(self.config.loss_weights))]
+        optima_lw = optim.SGD(params_lw, lr=config.lr)
+
+        return [
+            {
+                "optimizer": optima,
+                "lr_scheduler": {"scheduler": scheduler, "monitor": "val_loss"},
+            },
+            {
+                "optimizer": optima_lw,
+            },
+        ]
+
+
