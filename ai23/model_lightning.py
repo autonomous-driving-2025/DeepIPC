@@ -1,6 +1,7 @@
 import os
 from collections import deque
 import sys
+import csv
 import numpy as np
 import tqdm
 import torch
@@ -14,29 +15,11 @@ from torchvision.datasets import MNIST
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 
+from utility import *
 import utility
+import config
 
-def gen_top_view_sc_ptcloud(self, pt_cloud_x, pt_cloud_z, semseg):
-        #proses awal
-        _, label_img = torch.max(semseg, dim=1) #pada axis C
-        cloud_data_n = torch.ravel(torch.tensor([[n for _ in range(self.h*self.w)] for n in range(semseg.shape[0])])).to(self.gpu_device, dtype=semseg.dtype)
 
-        #normalize ke frame
-        cloud_data_x = torch.round((pt_cloud_x + self.cover_area) * (self.w-1) / (2*self.cover_area)).ravel()
-        cloud_data_z = torch.round((pt_cloud_z * (1-self.h) / self.cover_area) + (self.h-1)).ravel()
-
-        #cari index interest
-        bool_xz = torch.logical_and(torch.logical_and(cloud_data_x <= self.w-1, cloud_data_x >= 0), torch.logical_and(cloud_data_z <= self.h-1, cloud_data_z >= 0))
-        idx_xz = bool_xz.nonzero().squeeze() #hilangkan axis dengan size=1, sehingga tidak perlu nambahkan ".item()" nantinya
-
-        coorx = torch.stack([cloud_data_n, label_img.ravel(), cloud_data_z, cloud_data_x])
-        coor_clsn = torch.unique(coorx[:, idx_xz]).long() #tensor harus long supaya bisa digunakan sebagai index
-        top_view_sc = torch.zeros_like(semseg) #ini lebih cepat karena secara otomatis size, tipe data, dan device sama dengan yang dimiliki inputnya (semseg)
-        try:
-            top_view_sc[coor_clsn[0], coor_clsn[1], coor_clsn[2], coor_clsn[3]] = 1.0
-        except IndexError:
-            print("Warning: coor_clsn is empty, skipping this frame")
-        return top_view_sc
 
 #FUNGSI INISIALISASI WEIGHTS MODEL
 #baca https://pytorch.org/docs/stable/nn.init.html
@@ -95,7 +78,7 @@ class ConvBlock(nn.Module):
 class ai23(pl.LightningModule):
     def __init__(self, config, device):#n_fmap, n_class=[23,10], n_wp=5, in_channel_dim=[3,2], spatial_dim=[240, 320], gpu_device=None):
         super(ai23, self).__init__()
-        self.config = config
+        self.config = config.GlobalConfig
         self.gpu_device = device
         self.automatic_optimization = False
         #------------------------------------------------------------------------------------------------
@@ -106,33 +89,33 @@ class ai23(pl.LightningModule):
         self.RGB_encoder.avgpool = nn.Sequential() # type: ignore # cara paling gampang untuk menghilangkan fc layer yang tidak diperlukan
         #SS
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.conv3_ss_f = ConvBlock(channel=[config.n_fmap_b3[4][-1]+config.n_fmap_b3[3][-1], config.n_fmap_b3[3][-1]])#, up=True)
-        self.conv2_ss_f = ConvBlock(channel=[config.n_fmap_b3[3][-1]+config.n_fmap_b3[2][-1], config.n_fmap_b3[2][-1]])#, up=True)
-        self.conv1_ss_f = ConvBlock(channel=[config.n_fmap_b3[2][-1]+config.n_fmap_b3[1][-1], config.n_fmap_b3[1][-1]])#, up=True)
-        self.conv0_ss_f = ConvBlock(channel=[config.n_fmap_b3[1][-1]+config.n_fmap_b3[0][-1], config.n_fmap_b3[0][0]])#, up=True)
-        self.final_ss_f = ConvBlock(channel=[config.n_fmap_b3[0][0], config.n_class], final=True)#, up=False)
+        self.conv3_ss_f = ConvBlock(channel=[self.config.n_fmap_b3[4][-1]+self.config.n_fmap_b3[3][-1], self.config.n_fmap_b3[3][-1]])#, up=True)
+        self.conv2_ss_f = ConvBlock(channel=[self.config.n_fmap_b3[3][-1]+self.config.n_fmap_b3[2][-1], self.config.n_fmap_b3[2][-1]])#, up=True)
+        self.conv1_ss_f = ConvBlock(channel=[self.config.n_fmap_b3[2][-1]+self.config.n_fmap_b3[1][-1], self.config.n_fmap_b3[1][-1]])#, up=True)
+        self.conv0_ss_f = ConvBlock(channel=[self.config.n_fmap_b3[1][-1]+self.config.n_fmap_b3[0][-1], self.config.n_fmap_b3[0][0]])#, up=True)
+        self.final_ss_f = ConvBlock(channel=[self.config.n_fmap_b3[0][0], self.config.n_class], final=True)#, up=False)
 
         #untuk semantic cloud generator
-        self.cover_area = config.coverage_area
-        self.n_class = config.n_class
-        self.h, self.w = int(config.crop_roi[0]/config.scale), int(config.crop_roi[1]/config.scale)
+        self.cover_area = self.config.coverage_area
+        self.n_class = self.config.n_class
+        self.h, self.w = int(self.config.crop_roi[0]/self.config.scale), int(self.config.crop_roi[1]/self.config.scale)
         #SC
         self.SC_encoder = models.efficientnet_b1(pretrained=False) #efficientnet_b0
-        self.SC_encoder.features[0][0] = nn.Conv2d(config.n_class, config.n_fmap_b1[0][0], kernel_size=3, stride=2, padding=1, bias=False) #ganti input channel conv pertamanya, buat SC cloud
+        self.SC_encoder.features[0][0] = nn.Conv2d(self.config.n_class, self.config.n_fmap_b1[0][0], kernel_size=3, stride=2, padding=1, bias=False) #ganti input channel conv pertamanya, buat SC cloud
         self.SC_encoder.classifier = nn.Sequential() #cara paling gampang untuk menghilangkan fc layer yang tidak diperlukan
         self.SC_encoder.avgpool = nn.Sequential()
         self.SC_encoder.apply(kaiming_init)
 
         #feature fusion
         self.necks_net = nn.Sequential( #inputnya dari 2 bottleneck
-            nn.Conv2d(config.n_fmap_b3[4][-1]+config.n_fmap_b1[4][-1], config.n_fmap_b3[4][1], kernel_size=1, stride=1, padding=0),
+            nn.Conv2d(self.config.n_fmap_b3[4][-1]+self.config.n_fmap_b1[4][-1], self.config.n_fmap_b3[4][1], kernel_size=1, stride=1, padding=0),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(config.n_fmap_b3[4][1], config.n_fmap_b3[4][0])
+            nn.Linear(self.config.n_fmap_b3[4][1], self.config.n_fmap_b3[4][0])
         )
 
-        self.gru = nn.GRUCell(input_size=8, hidden_size=config.n_fmap_b3[4][0])
-        self.pred_dwp = nn.Linear(config.n_fmap_b3[4][0], 2)
+        self.gru = nn.GRUCell(input_size=7, hidden_size=self.config.n_fmap_b3[4][0])
+        self.pred_dwp = nn.Linear(self.config.n_fmap_b3[4][0], 2)
 
     def forward(self, rgbs, pt_cloud_xs, pt_cloud_zs, rp1, rp2, velo_in):
         #bagian downsampling
@@ -182,6 +165,9 @@ class ai23(pl.LightningModule):
         hx = self.necks_net(cat([RGB_features_sum, SC_features_sum], dim=1))
         # initial input car location ke GRU, selalu buat batch size x 2 (0,0) (xy)
         xy = torch.zeros(size=(hx.shape[0], 2)).to(self.gpu_device, dtype=hx.dtype)
+
+        velo_in = velo_in.unsqueeze(1)
+
         #predict delta wp
         out_wp = list()
         for _ in range(self.config.pred_len):
@@ -195,6 +181,54 @@ class ai23(pl.LightningModule):
         pred_wp = torch.stack(out_wp, dim=1)
 
         return segs_f, pred_wp, sdcs
+    
+    def write_csv(self, total, seg, wp, lgrad):
+        with open(self.csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                self.global_step,
+                int(self.current_epoch),
+                float(total),
+                float(seg),
+                float(wp),
+                float(lgrad)
+            ])
+
+    
+    def gen_top_view_sc_ptcloud(self, pt_cloud_x, pt_cloud_z, semseg):
+        #proses awal
+        _, label_img = torch.max(semseg, dim=1) #pada axis C
+        cloud_data_n = torch.ravel(torch.tensor([[n for _ in range(self.h*self.w)] for n in range(semseg.shape[0])])).to(self.gpu_device, dtype=semseg.dtype)
+
+        #normalize ke frame
+        cloud_data_x = torch.round((pt_cloud_x + self.cover_area) * (self.w-1) / (2*self.cover_area)).ravel()
+        cloud_data_z = torch.round((pt_cloud_z * (1-self.h) / self.cover_area) + (self.h-1)).ravel()
+
+        #cari index interest
+        bool_xz = torch.logical_and(torch.logical_and(cloud_data_x <= self.w-1, cloud_data_x >= 0), torch.logical_and(cloud_data_z <= self.h-1, cloud_data_z >= 0))
+        idx_xz = bool_xz.nonzero().squeeze() #hilangkan axis dengan size=1, sehingga tidak perlu nambahkan ".item()" nantinya
+
+        N = min(cloud_data_n.numel(), 
+        label_img.numel(),
+        cloud_data_z.numel(),
+        cloud_data_x.numel())
+
+        coorx = torch.stack([
+            cloud_data_n[:N],
+            label_img.ravel()[:N],
+            cloud_data_z[:N],
+            cloud_data_x[:N]
+        ])
+
+        # coorx = torch.stack([cloud_data_n, label_img.ravel(), cloud_data_z, cloud_data_x])
+        coor_clsn = torch.unique(coorx[:, idx_xz]).long() #tensor harus long supaya bisa digunakan sebagai index
+        top_view_sc = torch.zeros_like(semseg) #ini lebih cepat karena secara otomatis size, tipe data, dan device sama dengan yang dimiliki inputnya (semseg)
+        try:
+            top_view_sc[coor_clsn[0], coor_clsn[1], coor_clsn[2], coor_clsn[3]] = 1.0
+        except IndexError:
+            # print("Warning: coor_clsn is empty, skipping this frame")
+            pass
+        return top_view_sc
 
     def training_step(self, batch, batch_idx):
         device = self.device
@@ -221,7 +255,7 @@ class ai23(pl.LightningModule):
 
         rp1 = torch.stack(batch['rp1'], dim=1).to(device, dtype=torch.float)
         rp2 = torch.stack(batch['rp2'], dim=1).to(device, dtype=torch.float)
-        gt_velocity = torch.stack(batch['lr_velo'], dim=1).to(device, dtype=torch.float)
+        gt_velocity = batch['velocity'].to(device, dtype=torch.float)
 
         gt_waypoints = [
             torch.stack(batch['waypoints'][j], dim=1).to(device, dtype=torch.float)
@@ -233,6 +267,8 @@ class ai23(pl.LightningModule):
         # 2. Forward pass
         # --------------------------
         pred_segs, pred_wp, _ = self(rgbs, pt_cloud_xs, pt_cloud_zs, rp1, rp2, gt_velocity)
+
+        
 
         # --------------------------
         # 3. Compute losses
@@ -329,7 +365,7 @@ class ai23(pl.LightningModule):
 
         rp1 = torch.stack(batch['rp1'], dim=1).to(device, dtype=torch.float)
         rp2 = torch.stack(batch['rp2'], dim=1).to(device, dtype=torch.float)
-        gt_velocity = torch.stack(batch['lr_velo'], dim=1).to(device, dtype=torch.float)
+        gt_velocity = batch['velocity'].to(device, dtype=torch.float)
 
         gt_waypoints = [
             torch.stack(batch['waypoints'][j], dim=1).to(device, dtype=torch.float)
@@ -366,16 +402,7 @@ class ai23(pl.LightningModule):
             "val_total_loss": total_loss.detach(),
             "val_seg_loss": loss_seg.detach(),
             "val_wp_loss": loss_wp.detach(),
-        }
-
-    def validation_epoch_end(self, outputs):
-        avg_total = torch.stack([x["val_total_loss"] for x in outputs]).mean()
-        avg_seg = torch.stack([x["val_seg_loss"] for x in outputs]).mean()
-        avg_wp = torch.stack([x["val_wp_loss"] for x in outputs]).mean()
-
-        self.log("val_total_loss_epoch", avg_total, prog_bar=True)
-        self.log("val_seg_loss_epoch", avg_seg)
-        self.log("val_wp_loss_epoch", avg_wp)
+        }   
 
     def test_step(self, batch, batch_idx):
         device = self.device
@@ -394,7 +421,7 @@ class ai23(pl.LightningModule):
 
         rp1 = torch.stack(batch['rp1'], dim=1).to(device, dtype=torch.float)
         rp2 = torch.stack(batch['rp2'], dim=1).to(device, dtype=torch.float)
-        gt_velocity = torch.stack(batch['lr_velo'], dim=1).to(device, dtype=torch.float)
+        gt_velocity = torch.stack(batch['velocity'], dim=1).to(device, dtype=torch.float)
 
         gt_waypoints = [
             torch.stack(batch['waypoints'][j], dim=1).to(device, dtype=torch.float)
@@ -444,16 +471,20 @@ class ai23(pl.LightningModule):
 
     def configure_optimizers(self):
         optima = optim.AdamW(self.parameters(), weight_decay=self.config.weight_decay)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optima, mode='min', factor=0.5, patience=4, min_lr=1e-6)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optima, mode='min', factor=0.1, patience=4, min_lr=1e-6)
 
         #optimizer lw
-        params_lw = [torch.cuda.FloatTensor([self.config.loss_weights[i]]).clone().detach().requires_grad_(True) for i in range(len(self.config.loss_weights))]
-        optima_lw = optim.SGD(params_lw, lr=config.lr)
+        params_lw = [
+            torch.tensor([self.config.loss_weights[i]], 
+                 dtype=torch.float32, 
+                 device='cuda').requires_grad_(True)
+            for i in range(len(self.config.loss_weights))]
+        optima_lw = optim.SGD(params_lw, lr=self.config.lr)
 
         return [
             {
                 "optimizer": optima,
-                "lr_scheduler": {"scheduler": scheduler, "monitor": "val_loss"},
+                "lr_scheduler": {"scheduler": scheduler, "monitor": "val_total_loss"},
             },
             {
                 "optimizer": optima_lw,
