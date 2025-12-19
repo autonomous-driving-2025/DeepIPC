@@ -12,7 +12,7 @@ import pytorch_lightning as pl
 from torch.utils.data import DataLoader, random_split
 from torchvision import datasets, transforms
 
-import utility
+from utility import *
 
 class KARR_Dataset(Dataset):
     def __init__(self, data_dir, conditions, config):
@@ -249,9 +249,6 @@ class KARR_Dataset(Dataset):
             self.bearing += preload_dict.item()['bearing']
             self.loc_heading += preload_dict.item()['loc_heading']
             self.velocity += preload_dict.item()['velocity']
-            print("TYPE:", type(preload_dict))
-            print("ITEM TYPE:", type(preload_dict.item()))
-            print("KEYS:", preload_dict.item().keys())
             print("Loading from:", preload_file)
             print("Preloading " + str(len(preload_dict.item()['rgb'])) + " sequences from " + preload_file)
 
@@ -279,19 +276,44 @@ class KARR_Dataset(Dataset):
         seq_loc_headings = self.loc_heading[index]
 
         for i in range(0, self.seq_len):
-        #RGB
+
+            # print(f"\n=== DEBUG POINT CLOUD {i} ===")
+            # print(f"File path: {seq_pt_clouds[i]}")
+        
+            #RGB
             data['rgbs'].append(torch.from_numpy(np.array(crop_matrix(cv2.imread(seq_rgbs[i]), resize=self.config.scale, crop=self.config.crop_roi).transpose(2,0,1))))
-        #SEG
+            #SEG
             data['segs'].append(torch.from_numpy(np.array(cls2one_hot(crop_matrix(cv2.imread(seq_segs[i]), resize=self.config.scale, crop=self.config.crop_roi), n_class=self.config.n_class))))
 
             pt_cloud = pypcd.PointCloud.from_path(seq_pt_clouds[i]).pc_data
+            
+            # print(f"Raw PCD shape: {pt_cloud.shape}")
+            # print(f"Raw PCD fields: {pt_cloud.dtype.names}")
+            # print(f"First 5 points - x: {pt_cloud['x'][:5]}, z: {pt_cloud['z'][:5]}")
+            
             pt_cloud = np.stack([pt_cloud['x'], pt_cloud['y'], pt_cloud['z']], axis=-1)
+            
+            # print(f"After stack shape: {pt_cloud.shape}")
+            # print(f"After stack range - x: [{pt_cloud[:,0].min():.2f}, {pt_cloud[:,0].max():.2f}]")
+            # print(f"After stack range - z: [{pt_cloud[:,2].min():.2f}, {pt_cloud[:,2].max():.2f}]")
+            
             pt_cloud_temp = np.full((1280 * 720, 3), np.nan, dtype=pt_cloud.dtype)
             pt_cloud_temp[:pt_cloud.shape[0]] = pt_cloud
             pt_cloud = pt_cloud_temp.reshape(1280, 720, 3)
 
 
-            pt_cloud = np.nan_to_num(crop_matrix(pt_cloud[ : , : , 0:3], resize=self.config.scale, crop=self.config.crop_roi).transpose(2,0,1), nan=0.0, posinf=39.99999, neginf=0.2) #min_d, max_d, -max_d, ambil xyz-nya saja 0:3, baca https://www.stereolabs.com/docs/depth-sensing/depth-settings/
+            pt_cloud = np.nan_to_num(pt_cloud, nan=0.0, posinf=39.99999, neginf=0.2)
+
+            # print(f"After nan_to_num range - x: [{pt_cloud[:,0].min():.2f}, {pt_cloud[:,0].max():.2f}]")
+
+            pt_cloud = crop_matrix(pt_cloud[:, :, 0:3], resize=self.config.scale, crop=self.config.crop_roi).transpose(2,0,1)
+
+            # print(f"After crop_matrix shape: {pt_cloud.shape}")
+            # print(f"Final pt_cloud shape: {pt_cloud.shape}")
+            # print(f"Final pt_cloud[0] (x) range: [{pt_cloud[0].min():.2f}, {pt_cloud[0].max():.2f}]")
+            # print(f"Final pt_cloud[2] (z) range: [{pt_cloud[2].min():.2f}, {pt_cloud[2].max():.2f}]")
+
+            # pt_cloud = np.nan_to_num(crop_matrix(pt_cloud[ : , : , 0:3], resize=self.config.scale, crop=self.config.crop_roi).transpose(2,0,1), nan=0.0, posinf=39.99999, neginf=0.2) #min_d, max_d, -max_d, ambil xyz-nya saja 0:3, baca https://www.stereolabs.com/docs/depth-sensing/depth-settings/
             # data['pt_cloud_xs'].append(torch.from_numpy(np.array(pt_cloud[0:1,:,:])))
             # data['pt_cloud_zs'].append(torch.from_numpy(np.array(pt_cloud[2:3,:,:])))
             data['pt_cloud_xs'].append(torch.from_numpy(pt_cloud[0:1, :, :].astype(np.float32)))
@@ -347,7 +369,7 @@ class KARR_DataModule(pl.LightningDataModule):
         super().__init__()
         self.data_dir = data_dir
         self.conditions = conditions
-        self.config = config
+        self.config = config.GlobalConfig
         self.train_dataset = None
         self.test_dataset = None
         self.val_dataset = None
@@ -355,16 +377,21 @@ class KARR_DataModule(pl.LightningDataModule):
 
     def setup(self, stage=None):
         if stage == "fit" or stage is None:
-            self.train_dataset = KARR_Dataset(data_dir = self.data_dir,conditions= self.config.train_conditions,config = self.config)
-            self.val_dataset = KARR_Dataset(data_dir = self.data_dir, conditions = self.config.val_conditions, config=self.config)
+            self.train_dataset = KARR_Dataset(data_dir = self.data_dir+'/train',conditions= self.config.train_conditions,config = self.config)
+            self.val_dataset = KARR_Dataset(data_dir = self.data_dir+'/val', conditions = self.config.val_conditions, config=self.config)
+            print("Train len :", len(self.train_dataset))
+            print("Val len   :", len(self.val_dataset))
         
         if stage == "test" or stage is None:
-            self.test_dataset = KARR_Dataset(self.data_dir, self.config.test_conditions, self.config)
+            self.test_dataset = KARR_Dataset(self.data_dir+'/test', self.config.test_conditions, self.config)
+            print("Test len  :", len(self.test_dataset))
 
             
 
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, shuffle=False, pin_memory = True, batch_size = self.config.batch_size, num_workers = self.config.num_workers, drop_last=True)
+        loader = DataLoader(self.train_dataset, shuffle=True, pin_memory = True, batch_size = self.config.batch_size, num_workers = self.config.num_workers, drop_last=True)
+        print(f"Total samples: {len(loader.dataset)}")
+        return loader
 
     def val_dataloader(self):
         return DataLoader(self.val_dataset, shuffle=False, pin_memory=True, batch_size = self.config.batch_size, num_workers = self.config.num_workers, drop_last=False)
